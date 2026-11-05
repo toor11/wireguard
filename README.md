@@ -98,7 +98,12 @@ Full log: `/var/log/pivpnhole-install.log`. Keys/details: `/etc/pivpn/wireguard/
 
 **Phone / tablet:** run on the VPS, then scan with the WireGuard app:
 ```bash
-pivpn -qr phone
+pivpn -qr phone                     # QR in the terminal (needs an interactive SSH session)
+```
+The installer also saves a PNG for every profile, so you can *copy* it instead of
+scanning from the terminal:
+```bash
+~/configs/phone-qr.png              # generated with:  qrencode -t PNG -r phone.conf -o phone-qr.png
 ```
 
 **Laptop / desktop:** copy `<user>/configs/laptop.conf` from the VPS (the
@@ -166,6 +171,9 @@ Add more labels/blocklists/regex in the dashboard, they apply instantly.
   drops them if `unbound-checkconf` rejects the version.
 - **`/tmp/setupVars.conf permission denied`** (PiVPN): delete that file and rerun —
   `sudo rm -f /tmp/setupVars.conf`.
+- **QR code PNGs that are garbage/not images**: that's `-t ANSIUTF8` (the *terminal*
+  text rendering) pointed at a file. Only use it for display in a terminal; for
+  files use the image type: `qrencode -t PNG -r profile.conf -o profile-qr.png`.
 - **Port 53 leak panic?** Check `ss -lntu | grep :53` — FTL binds `0.0.0.0`
   locally but your provider firewall (and not the app) decides what's public.
 - **IPv6**: keep it off server-side (`pivpnenableipv6=0` in setupVars.conf) unless

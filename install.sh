@@ -351,7 +351,19 @@ for c in "${CLIENTS[@]}"; do
         || pivpn add -n "$c" >/dev/null 2>&1 \
         || sudo pivpn add -n "$c" >/dev/null 2>&1 \
         || die "Could not create profile '${c}'."
-    log "Profile '${c}' -> ${INSTALL_HOME}/configs/${c}.conf   (QR: pivpn -qr ${c})"
+
+    # real PNG QR next to the config file (note: -t PNG, NOT the terminal
+    # type 'ANSIUTF8' which writes escape sequences into the "image")
+    if qrencode -t PNG -s 8 -m 2 \
+        -r "/etc/wireguard/configs/${c}.conf" \
+        -o "${INSTALL_HOME}/configs/${c}-qr.png" 2>/dev/null; then
+        chown "$(id -u "${INSTALL_USER}"):$(id -gn "${INSTALL_USER}")" \
+            "${INSTALL_HOME}/configs/${c}-qr.png" 2>/dev/null
+        log "Profile '${c}' -> ${INSTALL_HOME}/configs/${c}.conf"
+        log "   QR image -> ${INSTALL_HOME}/configs/${c}-qr.png (scan with the WireGuard app)"
+    else
+        warn "QR PNG generation failed for '${c}' - on-device QR still works: pivpn -qr ${c}"
+    fi
 done
 
 # ---------------------------------------------------------------- summary
