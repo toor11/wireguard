@@ -20,6 +20,10 @@
 #   --web-password PASS  Pi-hole dashboard password (default: random, printed at end).
 #   --port N             WireGuard listen port (default: 51820).
 #   --skip-firewall      Do not touch ufw (provider/firewall-cloud still needed).
+#   --full-tunnel        Route ALL device traffic (not just DNS) through the VPN.
+#                        Cost warning: counts against VPS egress (see README).
+#   --duckdns SUB TOKEN  Keep <SUB>.duckdns.org pointing at this VPS (cron, every 5 min)
+#                        and connect clients via the hostname - survives IP changes.
 #   -h | --help          Show this help.
 #
 # Provider-side note: the cloud firewall must allow udp/<port> from anywhere.
@@ -42,6 +46,9 @@ CLIENTS=()
 WG_PORT=51820
 WEB_PASSWORD=""
 SKIP_FIREWALL=false
+FULL_TUNNEL=false
+DDNS_SUB=""
+DDNS_TOKEN=""
 
 # ---------------------------------------------------------------- logging
 log()  { printf "%b  %s\n"  "${GREEN}✓${NC}" "$*"; }
@@ -50,7 +57,7 @@ die()  { printf "%b  %s\n"  "${RED}✗${NC}"   "$*" >&2; exit 1; }
 step() { printf "\n%s==> %s%s\n" "$GREEN" "$*" "$NC"; }
 
 # ---------------------------------------------------------------- args
-usage() { grep -E '^#   (--|Options|client|web-password|port|skip)' "$0" | sed 's/^#//'; exit 0; }
+usage() { grep -E '^#   (--|Options|client|web-password|port|skip|full|duck)' "$0" | sed 's/^#//'; exit 0; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -58,6 +65,8 @@ while [[ $# -gt 0 ]]; do
         --web-password)  WEB_PASSWORD="$2"; shift 2 ;;
         --port)          WG_PORT="$2"; shift 2 ;;
         --skip-firewall) SKIP_FIREWALL=true; shift ;;
+        --full-tunnel)   FULL_TUNNEL=true; shift ;;
+        --duckdns)       DDNS_SUB="$2"; DDNS_TOKEN="$3"; shift 3 ;;
         -h|--help)       usage ;;
         *) die "Unknown option: $1 (see --help)" ;;
     esac
@@ -317,7 +326,7 @@ install_user=${INSTALL_USER}
 UNATTUPG=1
 pivpnNET=${WG_SUBNET}
 subnetClass=${WG_SUBNET_CLASS}
-ALLOWED_IPS="${VPN_GW}/32"
+ALLOWED_IPS="$([[ $FULL_TUNNEL == true ]] && echo "0.0.0.0/0, ::0/0" || echo "${VPN_GW}/32")"
 pivpnPORT=${WG_PORT}
 pivpnMTU=${WG_MTU}
 PIVPN_EOF
@@ -339,6 +348,62 @@ VPN_GW="$(grep -m1 '^pivpnDNS1=' /etc/pivpn/wireguard/setupVars.conf | cut -d= -
 VPN_GW="${VPN_GW:-10.100.0.1}"
 INSTALL_USER="${INSTALL_USER:-user}"
 INSTALL_HOME="${INSTALL_HOME:-/home/${INSTALL_USER}}"
+DEFAULT_IF="${DEFAULT_IF:-$(ip route show default 2>/dev/null | sed -n 's/.*\sdev\s\([^ ]*\).*/\1/p' | head -1)}"
+
+# ---------------------------------------------------------------- phase 4b: full-tunnel server side
+if [[ "$FULL_TUNNEL" == true ]]; then
+    step "Configuring full-tunnel routing (forwarding + NAT)"
+
+    # 1. kernel forwarding (persistent, survives reboot)
+    if ! grep -qs 'net.ipv4.ip_forward=1' /etc/sysctl.d/70-pivpnhole.conf 2>/dev/null; then
+        echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/70-pivpnhole.conf
+        sysctl --system >/dev/null 2>&1
+    fi
+
+    # 2. NAT + FORWARD rules on the WireGuard interface via wg0.conf (re-applied on every wg-quick start)
+    if ! grep -qs 'MASQUERADE' /etc/wireguard/wg0.conf; then
+        sed -i "/^\[Interface\]/a\\
+PostUp = iptables -t nat -A POSTROUTING -o ${DEFAULT_IF} -j MASQUERADE ; iptables -A FORWARD -i wg0 -j ACCEPT\\
+PostDown = iptables -t nat -D POSTROUTING -o ${DEFAULT_IF} -j MASQUERADE ; iptables -D FORWARD -i wg0 -j ACCEPT\\
+" /etc/wireguard/wg0.conf
+    fi
+    systemctl restart wg-quick@wg0 2>/dev/null && \
+        log "Full tunnel active: client profiles route ALL traffic (AllowedIPs 0.0.0.0/0, ::0/0)." \
+        || die "Failed to restart wg0 with NAT rules."
+
+    warn "Reminder: with full-tunnel every site your devices fetch uses VPS egress bandwidth."
+    warn "On metered providers (AWS ~\$0.12/GB) prefer Lightsail ~\$3.50 (1 TB/mo), or keep the default split-tunnel."
+fi
+
+# ---------------------------------------------------------------- phase 4c: dynamic hostname (DuckDNS)
+if [[ -n "$DDNS_SUB" && -n "$DDNS_TOKEN" ]]; then
+    step "Setting up DuckDNS ($DDNS_SUB.duckdns.org)"
+
+    DDNS_DOMAIN="${DDNS_SUB}.duckdns.org"
+    [[ "$DDNS_DOMAIN" =~ ^[A-Za-z0-9.-]+\.duckdns\.org$ ]] || die "DuckDNS subdomain '$DDNS_SUB' looks invalid."
+
+    # one update now: verifies domain+token AND points the record at this VPS
+    RES="$(curl -s -m 10 "https://www.duckdns.org/update?domains=${DDNS_SUB}&token=${DDNS_TOKEN}")"
+    [[ "$RES" == "OK" ]] || die "DuckDNS update failed (got: '$RES') - check the subdomain and token at duckdns.org."
+
+    # keep it fresh every 5 minutes via /etc/cron.d (no crontab quoting headaches)
+    printf '%s\n' \
+        "*/5 * * * * root curl -s -m 15 \"https://www.duckdns.org/update?domains=${DDNS_SUB}&token=${DDNS_TOKEN}\" >/dev/null 2>&1 # pivpnhole duckdns" \
+        > /etc/cron.d/pivpnhole-duckdns
+    chmod 644 /etc/cron.d/pivpnhole-duckdns
+
+    # make all client profiles (existing + future) connect through the hostname
+    sed -i "s|^pivpnHOST=.*|pivpnHOST=${DDNS_DOMAIN}|" /etc/pivpn/wireguard/setupVars.conf 2>/dev/null
+    sed -i "s|^Endpoint = .*|Endpoint = ${DDNS_DOMAIN}:${WG_PORT}|" /etc/wireguard/configs/*.conf 2>/dev/null
+    chown "$(id -u "${INSTALL_USER}")":"$(id -gn "${INSTALL_USER}")" /etc/wireguard/configs/*.conf 2>/dev/null || true
+    sudo_test_home="$(getent passwd "${INSTALL_USER}" | cut -d: -f6)"
+    sed -i "s|^Endpoint = .*|Endpoint = ${DDNS_DOMAIN}:${WG_PORT}|" "${sudo_test_home:-/home/${INSTALL_USER}}/configs/"*.conf 2>/dev/null
+    log "DuckDNS is live: ${DDNS_DOMAIN} -> $(dig +short "$DDNS_DOMAIN" 2>/dev/null | head -1 || echo '(dns not propagated yet)')"
+    log "Profiles now connect via Endpoint = ${DDNS_DOMAIN}:${WG_PORT} (re-import .conf or re-scan QR on devices)."
+    log "DNS record refreshes every 5 min via /etc/cron.d/pivpnhole-duckdns."
+elif [[ -n "$DDNS_SUB" && -z "$DDNS_TOKEN" ]]; then
+    die "--duckdns needs both a subdomain and a token: --duckdns SUB TOKEN"
+fi
 
 # ---------------------------------------------------------------- phase 5: profiles
 step "Creating WireGuard client profiles: ${CLIENTS[*]}"
@@ -368,13 +433,15 @@ done
 
 # ---------------------------------------------------------------- summary
 PUB_IP="$(public_ip)"
+TUNNEL_MODE="$([[ $FULL_TUNNEL == true ]] && echo "FULL-TUNNEL (all traffic) - mind VPS egress costs!" || echo "DNS-only split-tunnel (default, ~zero bandwidth)")"
+ENDPOINT_HOST="${DDNS_DOMAIN:-$PUB_IP}"
 cat <<SUMMARY
 
 ${GREEN}============================================================${NC}
-       PIVPNHOLE INSTALLED - DNS-ONLY SPLIT-TUNNEL VPN
+       PIVPNHOLE INSTALLED - $TUNNEL_MODE
 ${GREEN}============================================================${NC}
 
-  WireGuard endpoint   : ${PUB_IP}:${WG_PORT}
+  WireGuard endpoint   : ${ENDPOINT_HOST}:${WG_PORT}
   Tunnel DNS (Pi-hole) : ${VPN_GW}
   Dashboard (VPN only) : http://${VPN_GW}/admin
   Dashboard password   : ${WEB_PASSWORD}

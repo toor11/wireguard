@@ -81,6 +81,16 @@ curl -fsSL https://raw.githubusercontent.com/<your-username>/wireguard/main/inst
   | sudo bash -s -- --client phone --client laptop
 ```
 
+Useful flags (all optional):
+
+| Flag | Effect |
+|---|---|
+| `--client NAME` | extra client profiles (repeatable) |
+| `--duckdns SUB TOKEN` | keep `SUB.duckdns.org` pointing at the VPS and connect clients via the hostname — survives IP changes ([section below](#dynamic-hostname-duckdns--never-chase-ip-changes)) |
+| `--full-tunnel` | route **all** device traffic through the VPN instead of DNS-only ([section below](#full-tunnel-routing-all-traffic)) |
+| `--web-password PASS` | fixed dashboard password |
+| `--port N` | custom WireGuard port |
+
 That's it. The installer:
 
 1. installs Unbound and points it at `127.0.0.1:5335` (recursive, DNSSEC-anchored),
@@ -142,6 +152,115 @@ Add more labels/blocklists/regex in the dashboard, they apply instantly.
 
 ---
 
+## Adding a new device ("user")
+
+Each device gets its own profile — that's how Pi-hole shows it by name in the
+dashboard and how you can revoke one device without touching the rest.
+
+```bash
+pivpn add -n tablet            # 1. create the profile  -> ~/configs/tablet.conf
+pivpn -qr tablet               # 2. scan with the WireGuard app (or copy the .conf)
+```
+
+Every new profile automatically inherits this server's settings: split-tunnel
+`AllowedIPs`, the correct `Endpoint` (hostname if you use DuckDNS), static
+arping via the tunnel and the current `DNS =` gateway. Kill a lost device:
+`pivpn remove tablet` (and delete the tunnel from its app).
+
+Tips:
+
+- one profile **per device**, not per person — profiles are binary (on/off);
+- the device shows up in the dashboard as `tablet.pivpn` (via PiVPN's hosts hook);
+- the local config copies in `~user/configs/` are what your devices import;
+  keep them `chmod 600` — a .conf contains the device private key.
+
+---
+
+## Dynamic hostname (DuckDNS) — never chase IP changes
+
+WireGuard clients hard-code `Endpoint = 1.2.3.4:51820`. If a VPS IP ever
+changes, all devices fail silently until re-imported. Two cures:
+
+**A. Reserve the IP** (AWS Elastic IP / GCP reserved address / provider sticky IP).
+One command on GCP, run while the *current* IP is still assigned:
+```bash
+gcloud compute addresses create my-vps-ip --region=<region> --addresses=$(curl -4 -s https://api.ipify.org)
+```
+Free while the instance stays up.
+
+**B. Dynamic DNS** (works on *any* provider, even truly dynamic IPs):
+
+The installer can do this for you:
+```bash
+| sudo bash -s -- --duckdns freesubname 1a2b3c-....duckdns-token
+```
+That script phase:
+1. verifies your domain+token with duckdns.org,
+2. installs `/etc/cron.d/pivpnhole-duckdns` (updates every 5 minutes),
+3. rewrites every profile (and future ones) to `Endpoint = <SUB>.duckdns.org:<port>`.
+
+Manual equivalent on an existing box:
+```bash
+# one-time: confirm the domain+token
+curl "https://www.duckdns.org/update?domains=SUB&token=TOKEN"
+# keep it fresh
+echo '*/5 * * * * root curl -s -m 15 "https://www.duckdns.org/update?domains=SUB&token=TOKEN" >/dev/null' \
+  | sudo tee /etc/cron.d/duckdns
+# point existing profiles at the hostname
+sudo sed -i "s|^Endpoint = .*|Endpoint = SUB.duckdns.org:51820|" /etc/wireguard/configs/*.conf
+sudo sed -i "s|^pivpnHOST=.*|pivpnHOST=SUB.duckdns.org|" /etc/pivpn/wireguard/setupVars.conf
+sudo sed -i "s|^Endpoint = .*|Endpoint = SUB.duckdns.org:51820|" ~/configs/*.conf
+pivpn -qr phone     # re-scan each device
+```
+Then migrating hosts is just: stop → snapshot → new IP → cron updates DNS →
+clients reconnect by themselves.
+
+---
+
+## Full tunnel (routing ALL traffic)
+
+Default is DNS-only **split-tunnel** (why: free-tier egress). If you want the
+VPN to carry all device traffic too:
+
+```bash
+| sudo bash -s -- --full-tunnel ...
+```
+
+What changes server-side (the script does it, and it's idempotent):
+- `net.ipv4.ip_forward=1` persisted in `/etc/sysctl.d/70-pivpnhole.conf`
+- `wg0.conf` gets `PostUp/PostDown` MASQUERADE + FORWARD rules
+- client profiles are generated with `AllowedIPs = 0.0.0.0/0, ::0/0`
+
+<details>
+<summary>Switch manually later</summary>
+
+```bash
+# server: add NAT
+sudo sed -i "/^\[Interface\]/a PostUp = iptables -t nat -A POSTROUTING -o $(ip -4 route show default | awk '{print \$5}') -j MASQUERADE ; iptables -A FORWARD -i wg0 -j ACCEPT" /etc/wireguard/wg0.conf
+sudo sysctl -w net.ipv4.ip_forward=1 && echo net.ipv4.ip_forward=1 | sudo tee /etc/sysctl.d/70-pivpnhole.conf
+sudo systemctl restart wg-quick@wg0
+# client: widen the per-device profile
+sed -i 's|^AllowedIPs = .*|AllowedIPs = 0.0.0.0/0, ::0/0|' ~/configs/phone.conf   && pivpn -qr phone
+```
+(PiVPN also honors `ALLOWED_IPS` in `/etc/pivpn/wireguard/setupVars.conf` for
+future profiles.)
+</details>
+
+**Cost reality-check** (repeated from the top, because full-tunnel is what makes it matter):
+
+| Provider | Free tier egress | Note |
+|---|---|---|
+| Oracle Cloud | 10 TB/mo | effectively free full-tunnel |
+| GCP | billed after ~1 GB | use a cloud NAT-aware region, expect charges |
+| AWS EC2 | 100 GB/mo free (fringe programs) | ~$0.12/GB after → £120/mo at 1 TB |
+| Lightsail $3.50/VPS | 1 TB/mo | the doc's recommendation for full tunnel |
+| Hetzner CX | 20 TB/mo | cheapest scale-up |
+
+If you only want **ad blocking** (the common case), stick with the default
+split-tunnel: zero egress, zero maintenance, and the dashboard stays reachable.
+
+---
+
 ## Security posture (by design)
 
 - Only **UDP 51820** is open to the internet (plus SSH 22 as managed by your provider).
@@ -194,8 +313,10 @@ install.sh
  ├── phase 1  /etc/unbound/unbound.conf.d/pi-hole.conf  (+ self-healing config check)
  ├── phase 2  detects GCP/AWS via metadata & prints provider firewall cmds; opens ufw if active
  ├── phase 3  Pi-hole v6 automated install (expect)     → dns.upstreams=127.0.0.1#5335
- ├── phase 4  PiVPN --unattended + --use-pihole        → split-tunnel ALLOWED_IPS=<gw>/32
- └── phase 5  client profiles (pivpn add) + dashboard password + summary
+ ├── phase 4  PiVPN --unattended + --use-pihole        → AllowedIPs=<gw>/32 (or 0.0.0.0/0, ::0/0 with --full-tunnel)
+ ├── phase 4b (--full-tunnel) ip_forward persist + wg0 PostUp MASQUERADE/FORWARD rules
+ ├── phase 4c (--duckdns) verify token, /etc/cron.d updater, re-point profiles+setupVars to hostname
+ └── phase 5  client profiles (pivpn add) + PNG QRs + dashboard password + summary
 ```
 
 The installer is idempotent: safe to re-run; existing components are detected
