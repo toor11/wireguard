@@ -206,16 +206,11 @@ from inside the VM) but prints provider-specific commands.
 
 ## Credits
 
-- The original **PiHole with PiVPN and Unbound on VPS** notes that inspired this repo
-  (with thanks to @SuspectTyrannosaurus, @DasJason, @afruitpie, @kryten2k35 and @bee-san).
 - The [Pi-hole team](https://pi-hole.net), the [Unbound NLnet Labs] devs, and the
   [PiVPN](https://github.com/pivpn/pivpn) maintainers.
 - Unbound config from the official Pi-hole guide: [docs.pi-hole.net/guides/unbound](https://docs.pi-hole.net/guides/unbound/).
 
-## Support this project
 
-If this saved you money on a controller/vpn box, buy the original guide's author a coffee:
-[![Donate](https://img.shields.io/badge/Donate-PayPal-green.svg)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=R4QX73RWYB3ZA)
 
 ## License
 
